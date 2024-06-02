@@ -1,0 +1,282 @@
+#!/usr/bin/bash
+
+
+# <<<--- variables --->>>
+
+shellname=$0
+scriptDir='/mnt/ddngs/zhangsw/project/MRD/ThermoS5/scripts'
+VardictBin='/mnt/ddngs/zhangsw/software/VarDict-1.8.3/bin'
+refFa='/mnt/user/errand/pipeline/MC3/ref/Homo_sapiens_assembly19.fasta'
+outdir=`pwd`'/outdir'
+prefix='sample'
+thread=4
+
+# usage
+function usage {
+    printf -- "Usage:\n    sh ${shellname} -r1 R1.fq -r2 R2.fq -l bed -s site.bed -v refFa -o outdir -p prefix -t thread \n\n";
+    printf -- "Required arguments: \n";
+    printf -- "    -r1|--read1        R1.fq \n";
+    printf -- "    -r2|--read2        R2.fq \n";
+    printf -- "    -l|--bed           bed region \n";
+    printf -- "    -s|--site         site coordinate bed \n";
+    printf -- "Optional arguments: \n";
+    printf -- "    -v|--ref           reference fasta, default '${refFa}' \n"
+    printf -- "    -o|--outdir        output path, default '${outdir}' \n";
+    printf -- "    -p|--prefix        output prefix, default '${prefix}' \n";
+    printf -- "    -t|--thread        thread, default '${thread}' \n";
+    printf -- "    -h|--help          help \n";
+    printf -- "@Author: Siwen Zhang, zhang.siwen@puruijizhun.com \n\n";
+    exit 0
+}
+
+
+# Arguments passing
+TEMP=`getopt -o r1:r2:l:s:v:o:p:t:h --long read1:,read2:,bed:,site:,ref:,outdir:,prefix:,thread:,help \
+     -n ${shellname} -- "$@"`
+
+# no arguments detected
+if [ $? != 0 ] || [ $# == 0 ]
+    then usage
+fi
+
+# set arguments
+eval set -- "$TEMP"
+while true ; do
+    case "$1" in
+        -r1|--read1)
+            r1="$2"; shift 2;;
+        -r2|--read2)
+            r2="$2"; shift 2;;
+        -l|--bed)
+            bed="$2"; shift 2 ;;
+        -s|--site)
+            site="$2"; shift 2 ;;
+        -v|--ref)
+            refFa="$2"; shift 2;;
+        -o|--outdir)
+            outdir="$2"; shift 2 ;;
+        -p|--prefix)
+            prefix="$2"; shift 2 ;;
+        -t|--thread)
+            thread="$2"; shift 2 ;;
+        -h|--help)
+            usage ;;
+        --)
+            shift ; break; exit 1;;
+        ?)
+            usage ;;
+        *)
+            usage ;;
+    esac
+done
+
+# arguments not null
+if [ "${r1}"=="" || "${r2}"=="" || "${bed}"=="" || "${site}"=="" ]
+then usage
+fi
+
+
+# pear merge fq1 and fq2
+
+mkdir -p ${outdir}/fastq_merge 
+#pear -f ${r1} -r ${r2} -o ${outdir}/fastq_merge/${prefix}.merge_pear \
+    -v 40 -m 200 -n 40 -t 40 \
+    -q 20 -u 0.01 \
+    -j ${thread} -y 8G
+
+
+# usearch merge fq1 and fq2
+#https://drive5.com/usearch/manual/cmds_all.html
+#https://drive5.com/usearch/manual/exp_errs.html
+
+# debug mode add:  -alnout ${outdir}/fastq_merge/${prefix}.merge_usearch.aln 
+
+usearch -fastq_mergepairs ${r1} \
+    -reverse ${r2} \
+    -fastqout ${outdir}/fastq_merge/${prefix}.merge_usearch.fq \
+    -tabbedout ${outdir}/fastq_merge/${prefix}.merge_usearch.tsv \
+    -fastqout_notmerged_fwd ${outdir}/fastq_merge/${prefix}.notmerged_R1.fq \
+    -fastqout_notmerged_rev ${outdir}/fastq_merge/${prefix}.notmerged_R2.fq \
+    -threads ${thread} \
+    -fastq_maxdiffs 10 -fastq_pctid 90 -fastq_merge_maxee 0.01 \
+    -fastq_minovlen 40 -fastq_minmergelen 40 -fastq_maxmergelen 200 \
+    2> ${outdir}/fastq_merge/${prefix}.merge_usearch.stats
+
+
+# not merged reads
+
+mkdir -p ${outdir}/fastq_merge/not_merged
+awk '$2=="nohsp"{print $1}' ${outdir}/fastq_merge/${prefix}.merge_usearch.tsv > ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid
+
+cat ${outdir}/fastq_merge/${prefix}.notmerged_R1.fq | paste - - - - |\
+    awk 'BEGIN{FS="\t";OFS="\n"}NR==FNR{a["@"$1]=$1}NR>FNR{if(a[$1]){print $1,$2,$3,$4}}' ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid - > ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.R1.fq
+cat ${outdir}/fastq_merge/${prefix}.notmerged_R2.fq | paste - - - - | \
+    awk 'BEGIN{FS="\t";OFS="\n"}NR==FNR{a["@"$1]=$1}NR>FNR{if(a[$1]){print $1,$2,$3,$4}}' ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid - > ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.R2.fq
+
+bwa mem -t ${thread} -M -R "@RG\\tID:NULL\\tSM:${prefix}\\tLB:NULL\\tPU:NULL\\tPL:illumina\\tCN:prec_sci" ${refFa} ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.R1.fq ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.R2.fq | \
+    samtools view -Sb -@ ${thread} -L ${bed} -q 30 -t ${refFa}.fai - > ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.bam
+
+sambamba sort -t ${thread} -l 1 -o ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.sorted.bam ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.bam
+
+samtools index -@ ${thread} ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.sorted.bam ${outdir}/fastq_merge/not_merged/${prefix}.merge_usearch.nohsp_readid.sorted.bam.bai
+
+
+
+
+# sequence clustering and filtering
+# If the next sequence matches an existing centroid, it is assigned to that cluster, otherwise it becomes the centroid of a new cluster. This means that sequences should be ordered so that the most appropriate centroids tend to appear earlier in the file.
+
+#mkdir -p ${outdir}/cluster
+
+#awk 'BEGIN{FS="\t";OFS="\t"}{if($1!=""){print $1,$2-20,$3+20}}' ${bed}|\
+    #bedtools getfasta -fi ${refFa} -bed - | \
+    #awk 'NR%2==1{gsub("^>","@ref:",$0);print $0}NR%2==0{print $0; print "+";for (i=1;i<=length($0);i++){printf "J"}; printf ORS}' - > ${outdir}/cluster/target_ref.fastq
+
+#cat ${outdir}/cluster/target_ref.fastq ${outdir}/fastq_merge/${prefix}.merge_usearch.fq > ${outdir}/cluster/${prefix}.merge_usearch.add_ref.fq
+
+#usearch -cluster_fast ${outdir}/cluster/${prefix}.merge_usearch.add_ref.fq -centroids ${outdir}/cluster/centroids.fasta -uc ${outdir}/cluster/clusters.uc \
+#    -id 0.9 -query_cov 0.8 -target_cov 0.8 \
+#    -maxdiffs 5 -strand both 
+# id: identity, the number of identities divided by the number of alignment columns
+
+# discard singletons
+#usearch -sortbysize derep.fasta -output derep2.fasta -minsize 2
+
+# Determines error rates of amplicon reads
+#usearch -fastx_learn uniques.fastq -output learn.txt
+
+
+
+# fastp
+
+#mkdir -p ${outdir}/fastp
+
+#fastp --in1 ${R1} --out1 R1.clean.fastq.gz --in2 ${R2} --out2 R2.clean.fastq.gz --json ~{outdir}/~{name}.json --html ~{outdir}/~{name}.html --thread ~{thread} --qualified_quality_phred 5 --unqualified_percent_limit 50 --n_base_limit 15 --length_required 50
+
+#fastp --in1 ${outdir}/fastq_merge/${prefix}.merge_usearch.fq \
+    #--json ${outdir}/fastp/${prefix}.json \
+    #--html ${outdir}/fastp/${prefix}.html \
+    #--thread ${thread} --qualified_quality_phred 20 --unqualified_percent_limit 10 --n_base_limit 2 #--length_required 40 \
+    #1> ${outdir}/fastp/${prefix}.tsv
+
+
+# mapping
+
+mkdir -p ${outdir}/mapping
+
+bwa mem -t ${thread} -M \
+    -R "@RG\\tID:NULL\\tSM:${prefix}\\tLB:NULL\\tPU:NULL\\tPL:illumina\\tCN:prec_sci" \
+    ${refFa} ${outdir}/fastq_merge/${prefix}.merge_usearch.fq 2> log.txt 1> ${outdir}/mapping/${prefix}.sam
+
+samtools view -Sb -@ ${thread} -t ${refFa}.fai ${outdir}/mapping/${prefix}.sam > ${outdir}/mapping/${prefix}.bam
+
+sambamba sort -t ${thread} -l 1 -o ${outdir}/mapping/${prefix}.sorted.bam ${outdir}/mapping/${prefix}.bam
+
+samtools index -@ ${thread} ${outdir}/mapping/${prefix}.sorted.bam ${outdir}/mapping/${prefix}.sorted.bam.bai 
+
+
+
+# stats
+
+mkdir -p ${outdir}/stats
+
+# count base number for each region
+#https://broadinstitute.github.io/picard/
+
+if [ -f ${refFa}.dict ]
+then refDict=${refFa}.dict
+else refDict=`echo ${refFa}|sed 's/fasta$//'|sed 's/fa$//'`"dict"
+fi
+
+bed_name=`basename -s '.bed' ${bed}`
+
+picard BedToIntervalList \
+    -I ${bed} \
+    -O ${outdir}/stats/${bed_name}.intervalList \
+    -SD ${refDict}
+
+picard CollectTargetedPcrMetrics \
+    I=${outdir}/mapping/${prefix}.sorted.bam \
+    O=${outdir}/stats/${prefix}.CollectTargetedPcrMetrics \
+    R=${refFa} \
+    AMPLICON_INTERVALS=${outdir}/stats/${bed_name}.intervalList \
+    TARGET_INTERVALS=${outdir}/stats/${bed_name}.intervalList \
+    PER_TARGET_COVERAGE=${outdir}/stats/${prefix}.per_target_cov \
+    PER_BASE_COVERAGE=${outdir}/stats/${prefix}.per_base_cov \
+    MINIMUM_BASE_QUALITY=20 \
+    MINIMUM_MAPPING_QUALITY=30 \
+    NEAR_DISTANCE=100 
+
+python ${scriptDir}/mapping_qc_stats.py \
+    --metrics ${outdir}/stats/${prefix}.CollectTargetedPcrMetrics \
+    --per_base_cov ${outdir}/stats/${prefix}.per_base_cov \
+    --per_target_cov ${outdir}/stats/${prefix}.per_target_cov \
+    --bed ${bed} \
+    --out ${outdir}/stats/${prefix}.QCstats.tsv
+
+
+
+# mutations
+
+mkdir ${outdir}/mutations
+
+#/mnt/ddngs/zhangsw/miniconda3/envs/bam-readcount/bin/bam-readcount \
+    #--min-mapping-quality 30 --min-base-quality 20 --max-warnings 0 \
+    #-f ${refFa} -l ${bed} \
+    #${outdir}/mapping/${prefix}.sorted.bam > ${outdir}/mutations/${prefix}.bam-readcount
+
+#python ${scriptDir}/readcount_extraction.py \
+    #--vcf ${vcf} \
+    #--count mutations/${prefix}.bam-readcount \
+    #--out mutations/${prefix}.bam-readcount.vaf.tsv \
+    #--mode vaf --soft bam-readcount --detail
+
+#python ${scriptDir}/readcount_filter.py \
+    #--in mutations/${prefix}.bam-readcount.vaf.tsv \
+    #--out mutations/${prefix}.bam-readcount.vaf.filter.tsv \
+    #--dp 500 --ad 2
+
+    
+#freebayes \
+    #--min-alternate-count 2 --min-alternate-fraction 0.00005 \
+    #--min-mapping-quality 30 --min-base-quality 20 \
+    #-t ${bed} \
+    #-f ${refFa} ${outdir}/mapping/${prefix}.sorted.bam > ${outdir}/mutations/${prefix}.freebayes.vcf
+    
+
+# pileup-bcftools
+
+samtools mpileup -t DP -t SP -t AD --VCF --uncompressed --max-depth 200000 \
+    -o ${outdir}/mutations/${prefix}.mpileup.vcf \
+    -f ${refFa} -l ${bed} --min-MQ 30 --min-BQ 20 \
+    ${outdir}/mapping/${prefix}.sorted.bam
+bcftools call -v -m -P 0.00001 -T ${bed} -A ${outdir}/mutations/${prefix}.mpileup.vcf > ${outdir}/mutations/${prefix}.mpileup.filter.vcf
+
+
+# vardict
+
+awk 'BEGIN{FS="\t";OFS="\t"}{if($1!=""){print $1,$2-20,$3+20,$4,"0",".",$2,$3}}' ${bed} > ${outdir}/mutations/${bed_name}.amplicon.bed
+
+${VardictBin}/VarDict -G ${refFa} \
+    -N "SAMPLE" \
+    -b "${outdir}/mapping/${prefix}.sorted.bam" \
+    -th 4 -O 3 -Q 3 -F 0 -P 1 -p -a 20:0.2 \
+    --nosv -f 0.0001 -c 1 -S 2 -E 3 -g 4 ${outdir}/mutations/${bed_name}.amplicon.bed | \
+    ${VardictBin}/teststrandbias.R | \
+    ${VardictBin}/var2vcf_valid.pl \
+        -A -N "SAMPLE" -d 1000 -v 3 -f 0.0001 -p 1  > ${outdir}/mutations/${prefix}.vardict.vcf
+
+# amplicon mode bed file. There first two numbers include primers, and the last two numbers are insert only.
+# VarDict will perform in silico trimming of primers, and for variants in overlapping amplicons, they needs to be detectable by both amplicons, otherwise, they're flagged as amplicon-bias, and likely false positives.
+#chr1    115247094       115247253       NRAS    0       .       115247117       115247232
+#chr1    115247202       115247341       NRAS    0       .       115247224       115247323
+
+
+# filter
+
+gzip ${outdir}/mutations/${prefix}.vardict.vcf && tabix ${outdir}/mutations/${prefix}.vardict.vcf.gz
+bcftools view -i "FORMAT/VD>=10 && %FILTER='PASS'" ${outdir}/mutations/${prefix}.vardict.vcf.gz > ${outdir}/mutations/${prefix}.vardict.filter.vcf
+
+bedtools intersect -wb -a ${outdir}/mutations/${prefix}.vardict.filter.vcf -b ${outdir}/mutations/${prefix}_external_primer_design_mergePRandZG.20220624.bed > ${outdir}/mutations/${prefix}.vardict.filter.intersect.tsv
+
+awk '{if($1~/^#/){print $0} else{split($10,a,":"); if(($4=="G"&&$5=="A"&&a[5]>=0.0003)||($4=="C"&&$5=="T"&&a[5]>=0.0003)){print $0}}}' ${outdir}/mutations/${prefix}.vardict.filter.intersect.filter_transition.tsv
